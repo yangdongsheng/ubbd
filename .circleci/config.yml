@@ -34,7 +34,7 @@ workflows:
       - run-ubbd-tests-ubuntu-2204
   run-ubbd-tests-ubuntu-20-04-arm-workflow:
     jobs:
-      - run-ubbd-tests-ubuntu-2004-arm
+      - run-ubbd-tests-ubuntu-2004-arm:
           filters:
             pull_requests:
               types: [opened, synchronize]
