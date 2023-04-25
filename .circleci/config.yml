@@ -14,7 +14,7 @@ jobs:
       - checkout
       - run:
           name: "run ubbd tests on ubuntu-20-04"
-          command: "sudo ./setup_ceph.sh"
+          command: "sudo export NPROC=$NPROC; sudo ./setup_ceph.sh"
   run-ubbd-tests-ubuntu-2004-arm:
     machine:
       image: ubuntu-2004:current
@@ -35,3 +35,8 @@ workflows:
   run-ubbd-tests-ubuntu-20-04-arm-workflow:
     jobs:
       - run-ubbd-tests-ubuntu-2004-arm
+          filters:
+            pull_requests:
+              types: [opened, synchronize]
+              labels:
+                only: integration-tests
