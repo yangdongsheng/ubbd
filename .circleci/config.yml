@@ -37,5 +37,9 @@ workflows:
       - run-ubbd-tests-ubuntu-2004-arm:
           filters:
             pull_requests:
+              branches:
+                only:
+                  - main
               labels:
-                only: integration-tests
+                only:
+                  - integration-tests
