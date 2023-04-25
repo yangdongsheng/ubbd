@@ -5,20 +5,33 @@ version: 2.1
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/configuration-reference/#jobs
 jobs:
-  run-ubbd-tests:
+  run-ubbd-tests-ubuntu-2004:
     machine:
       image: ubuntu-2004:current
-    resource_class: large
+    resource_class: medium
 
     steps:
       - checkout
       - run:
           name: "run ubbd tests on ubuntu-20-04"
           command: "sudo ./run_ubbd_tests.sh"
+  run-ubbd-tests-ubuntu-2004-arm:
+    machine:
+      image: ubuntu-2004:current
+    resource_class: arm.medium
+
+    steps:
+      - checkout
+      - run:
+          name: "run ubbd tests on ubuntu-20-04 arm"
+          command: "sudo ./run_ubbd_tests.sh"
 
 # Orchestrate jobs using workflows
 # See: https://circleci.com/docs/configuration-reference/#workflows
 workflows:
-  run-ubbd-tests-workflow:
+  run-ubbd-tests-ubuntu-20-04-workflow:
     jobs:
-      - run-ubbd-tests
+      - run-ubbd-tests-ubuntu-2004
+  run-ubbd-tests-ubuntu-20-04-arm-workflow:
+    jobs:
+      - run-ubbd-tests-ubuntu-2004-arm
