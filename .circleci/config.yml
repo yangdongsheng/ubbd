@@ -24,7 +24,9 @@ jobs:
       - checkout
       - run:
           name: "run ubbd tests on ubuntu-20-04 arm"
-          command: "sudo ./run_ubbd_tests.sh"
+          command: |
+            if curl --silent --user $GITHUB_NAME:$GITHUB_PASSWORD https://api.github.com/repos/ORG/REPO/issues/$(echo $CI_PULL_REQUEST | grep -oE "[^/pull]+$") | grep .name | grep "Don't Merge" ; then exit 1 ; else echo "Continue Build" ; fi
+            "sudo ./run_ubbd_tests.sh"
 
 # Orchestrate jobs using workflows
 # See: https://circleci.com/docs/configuration-reference/#workflows
@@ -40,6 +42,3 @@ workflows:
               branches:
                 only:
                   - main
-              labels:
-                only:
-                  - integration-tests
