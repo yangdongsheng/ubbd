@@ -221,22 +221,22 @@ static inline void ubbd_atomic64_dec(ubbd_atomic64 *a)
 	atomic_dec(a);
 }
 
-static inline int ubbd_atomic64_add_return(int i, ubbd_atomic *a)
+static inline long ubbd_atomic64_add_return(long i, ubbd_atomic *a)
 {
 	return __sync_add_and_fetch(a, i);
 }
 
-static inline int ubbd_atomic64_sub_return(int i, ubbd_atomic *a)
+static inline long ubbd_atomic64_sub_return(long i, ubbd_atomic *a)
 {
 	return __sync_sub_and_fetch(a, i);
 }
 
-static inline int ubbd_atomic64_inc_return(ubbd_atomic *a)
+static inline long ubbd_atomic64_inc_return(ubbd_atomic *a)
 {
 	return ubbd_atomic64_add_return(1, a);
 }
 
-static inline int ubbd_atomic64_dec_return(ubbd_atomic *a)
+static inline long ubbd_atomic64_dec_return(ubbd_atomic *a)
 {
 	return ubbd_atomic_sub_return(1, a);
 }
