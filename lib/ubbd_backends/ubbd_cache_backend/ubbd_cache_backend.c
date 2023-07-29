@@ -26,7 +26,6 @@ struct ubbd_skiplist {
 static struct ubbd_skiplist *cache_key_lists;
 static uint64_t cache_key_list_num;
 pthread_mutex_t cache_io_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t cache_disk_append_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct ubbd_backend *cache_backend;
 struct ubbd_backend *backing_backend;
@@ -44,7 +43,7 @@ struct cache_key {
 	uint64_t	l_off;
 	uint64_t	p_off;
 	uint32_t	len;
-	uint64_t	flags;
+	uint32_t	flags;
 	uint64_t	seg_gen;
 };
 
@@ -79,9 +78,9 @@ struct cache_key_ondisk {
 	__u64	l_off;
 	__u64	p_off;
 	__u32	len;
-	__u32	seq;
+	__u32	flags;
+	__u64	seq;
 	__u64	seg_gen;
-	__u64	flags;
 };
 
 
@@ -92,7 +91,7 @@ struct cache_kset_ondisk {
 	__u16	version;
 	__u16	res_1;
 	__u32	key_epoch;
-	__u64	flags;
+	__u32	flags;
 	union {
 		__u16	keys;
 		__u64	next_seg;
@@ -110,7 +109,7 @@ struct segment {
 	uint64_t index;
 	uint32_t used;
 	uint32_t dirty;
-	uint64_t flags;
+	uint32_t flags;
 	uint64_t gen;
 	ubbd_atomic inflight;
 	pthread_mutex_t lock;
@@ -128,6 +127,7 @@ struct seg_pos {
 struct cache_key_ondisk_write {
 	struct cache_key_ondisk keys[CACHE_KEY_WRITE_MAX];
 	int key_used;
+	pthread_mutex_t append_mutex;
 };
 
 struct data_head {
@@ -154,7 +154,7 @@ struct cache_super {
 
 	uint32_t last_key_epoch;
 
-	struct cache_key_ondisk_write *key_ondisk_w;
+	struct cache_key_ondisk_write **key_ondisk_w_array;
 };
 
 static void dump_bitmap(struct ubbd_bitmap *bitmap)
@@ -358,7 +358,7 @@ static void cache_seg_put(uint64_t index)
 
 static uint64_t seg_pos_to_addr(struct seg_pos *pos);
 static int cache_sb_write(void);
-static int cache_key_ondisk_write(void)
+static int cache_key_ondisk_write(struct cache_key_ondisk_write *key_ondisk_w)
 {
 	static char kset_buf[CACHE_KSET_SIZE] __attribute__ ((__aligned__ (4096))) = { 0 };
 	struct cache_kset_ondisk *kset = (struct cache_kset_ondisk *)kset_buf;
@@ -366,20 +366,20 @@ static int cache_key_ondisk_write(void)
 	uint64_t next_seg;
 	int ret;
 
-	if (!cache_sb.key_ondisk_w->key_used)
+	if (!key_ondisk_w->key_used)
 		return 0;
 
 	if (lcache_debug)
-		ubbd_err("key_used: %d\n", cache_sb.key_ondisk_w->key_used);
+		ubbd_err("key_used: %d\n", key_ondisk_w->key_used);
 again:
 	addr = seg_pos_to_addr(&cache_sb.key_head_pos);
 	memset(kset_buf, 0, CACHE_KSET_SIZE);
 
 	space_required = sizeof(struct cache_kset_ondisk) +
-		cache_sb.key_ondisk_w->key_used * sizeof(struct cache_key_ondisk);
+		key_ondisk_w->key_used * sizeof(struct cache_key_ondisk);
 
 	if (lcache_debug)
-		ubbd_err("space_required: %lu, key_used: %u\n", space_required, cache_sb.key_ondisk_w->key_used);
+		ubbd_err("space_required: %lu, key_used: %u\n", space_required, key_ondisk_w->key_used);
 
 	space_required = ubbd_roundup(space_required, 4096);
 
@@ -421,10 +421,10 @@ again:
 
 	kset->magic = CACHE_KSET_MAGIC;
 	kset->version = 0;
-	kset->keys = cache_sb.key_ondisk_w->key_used;
+	kset->keys = key_ondisk_w->key_used;
 	kset->kset_len = space_required;
 	kset->key_epoch = cache_sb.last_key_epoch;
-	memcpy(kset->data, cache_sb.key_ondisk_w->keys, sizeof(struct cache_key_ondisk) * cache_sb.key_ondisk_w->key_used);
+	memcpy(kset->data, key_ondisk_w->keys, sizeof(struct cache_key_ondisk) * key_ondisk_w->key_used);
 
 	if (lcache_debug)
 		ubbd_err("write normal kset: %lu\n", addr);
@@ -435,19 +435,30 @@ again:
 		return ret;
 	}
 	cache_sb.key_head_pos.off_in_seg += space_required;
-	cache_sb.key_ondisk_w->key_used = 0;
+	key_ondisk_w->key_used = 0;
 
 	return 0;
 }
 
-static int cache_key_ondisk_append(struct cache_key *key)
+static void cache_key_ondisk_write_all(struct ubbd_backend *ubbd_b)
+{
+	int i;
+
+	for (i = 0; i < ubbd_b->num_queues; i++) {
+		cache_key_ondisk_write(cache_sb.key_ondisk_w_array[i]);
+	}
+
+	return;
+}
+
+static int cache_key_ondisk_append(struct cache_key *key, struct cache_key_ondisk_write *key_ondisk_w)
 {
 	int ret;
 
-	pthread_mutex_lock(&cache_disk_append_mutex);
-	cache_key_encode(key, &cache_sb.key_ondisk_w->keys[cache_sb.key_ondisk_w->key_used++]);
-	if (cache_sb.key_ondisk_w->key_used >= CACHE_KEY_WRITE_MAX) {
-		ret = cache_key_ondisk_write();
+	pthread_mutex_lock(&key_ondisk_w->append_mutex);
+	cache_key_encode(key, &key_ondisk_w->keys[key_ondisk_w->key_used++]);
+	if (key_ondisk_w->key_used >= CACHE_KEY_WRITE_MAX) {
+		ret = cache_key_ondisk_write(key_ondisk_w);
 		if (ret) {
 			ubbd_err("failed to write ondisk key.\n");
 			goto out;
@@ -456,7 +467,7 @@ static int cache_key_ondisk_append(struct cache_key *key)
 	ret = 0;
 
 out:
-	pthread_mutex_unlock(&cache_disk_append_mutex);
+	pthread_mutex_unlock(&key_ondisk_w->append_mutex);
 
 	return ret;
 }
@@ -826,7 +837,7 @@ again:
 	ubbd_bit_set(cache_sb.seg_bitmap, seg);
 
 	if (!cache_key_written) {
-		cache_key_ondisk_write();
+		cache_key_ondisk_write_all(&cache_b->ubbd_b);
 		cache_key_written = true;
 		goto again;
 	}
@@ -1211,22 +1222,31 @@ static int cache_backend_open(struct ubbd_backend *ubbd_b)
 	cache_sb.last_key_epoch = sb->last_key_epoch;
 
 
-	ret = ubbd_open_uio(&ubbd_b->queues[0].uio_info);
-	if (ret) {
-		ubbd_err("failed to open uio for queue 0: %d\n", ret);
+	cache_sb.key_ondisk_w_array = calloc(ubbd_b->num_queues, sizeof(struct cache_key_ondisk_write *));
+	if (!cache_sb.key_ondisk_w_array) {
+		ubbd_err("failed to alloc key_ondisk_w_array");
 		goto close_cache;
 	}
 
-	cache_sb.key_ondisk_w = ubbd_uio_get_info(&ubbd_b->queues[0].uio_info);
+	int i;
+	for (i = 0; i < ubbd_b->num_queues; i++) {
+		ret = ubbd_open_uio(&ubbd_b->queues[i].uio_info);
+		if (ret) {
+			ubbd_err("failed to open uio for queue %d: %d\n", i, ret);
+			goto free_key_ondisk_w_array;
+		}
+
+		cache_sb.key_ondisk_w_array[i] = ubbd_uio_get_info(&ubbd_b->queues[i].uio_info);
+		pthread_mutex_init(&cache_sb.key_ondisk_w_array[i]->append_mutex, NULL);
+	}
 
 	cache_sb.segments = calloc(cache_sb.n_segs, sizeof(struct segment));
 	if (!cache_sb.segments) {
 		ubbd_err("failed to alloc mem for segments.\n");
 		ret = -ENOMEM;
-		goto close_cache;
+		goto free_key_ondisk_w_array;
 	}
 
-	int i;
 	for (i = 0; i < cache_sb.n_segs; i++) {
 		pthread_mutex_init(&cache_sb.segments[i].lock, NULL);
 		atomic_set(&cache_sb.segments[i].inflight, 0);
@@ -1267,6 +1287,11 @@ free_seg_bitmap:
 	ubbd_bitmap_free(cache_sb.seg_bitmap);
 free_segments:
 	free(cache_sb.segments);
+free_key_ondisk_w_array:
+	for (i = 0; i < ubbd_b->num_queues; i++) {
+		ubbd_close_uio(&ubbd_b->queues[i].uio_info);
+	}
+	free(cache_sb.key_ondisk_w_array);
 close_cache:
 	ubbd_backend_close(cache_b->cache_backend);
 close_backing:
@@ -1293,8 +1318,9 @@ static void wait_for_cache_clean(struct ubbd_cache_backend *cache_b)
 static void cache_backend_close(struct ubbd_backend *ubbd_b)
 {
 	struct ubbd_cache_backend *cache_b = CACHE_BACKEND(ubbd_b);
+	int i;
 
-	cache_key_ondisk_write();
+	cache_key_ondisk_write_all(ubbd_b);
 
 	if (cache_b->detach_on_close) {
 		wait_for_cache_clean(cache_b);
@@ -1306,7 +1332,10 @@ static void cache_backend_close(struct ubbd_backend *ubbd_b)
 	cache_key_lists_release();
 	ubbd_bitmap_free(cache_sb.seg_bitmap);
 	free(cache_sb.segments);
-	ubbd_close_uio(&ubbd_b->queues[0].uio_info);
+	for (i = 0; i < ubbd_b->num_queues; i++) {
+		ubbd_close_uio(&ubbd_b->queues[i].uio_info);
+	}
+	free(cache_sb.key_ondisk_w_array);
 	ubbd_backend_close(cache_b->cache_backend);
 	ubbd_backend_close(cache_b->backing_backend);
 }
@@ -1334,6 +1363,7 @@ struct cache_backend_io_ctx_data {
 	uint64_t backing_off;
 	bool cache_io;
 	struct cache_key *key;
+	struct cache_key_ondisk_write *key_write;
 };
 
 /*
@@ -1382,7 +1412,7 @@ static int cache_backend_write_io_finish(struct context *ctx, int ret)
 		goto finish;
 	}
 
-	cache_key_ondisk_append(key);
+	cache_key_ondisk_append(key, data->key_write);
 
 finish:
 	if (lcache_debug)
@@ -1421,6 +1451,11 @@ static int cache_backend_read_io_finish(struct context *ctx, int ret)
 	return 0;
 }
 
+struct cache_key_ondisk_write *cache_get_key_write(struct ubbd_backend *ubbd_b, struct ubbd_backend_io *io)
+{
+	return cache_sb.key_ondisk_w_array[io->queue_id % ubbd_b->num_queues];
+}
+
 static struct ubbd_backend_io* prepare_backend_io(struct ubbd_backend *ubbd_b,
 		struct ubbd_backend_io *io,
 		uint64_t off, uint32_t size, ubbd_ctx_finish_t finish_fn)
@@ -1448,6 +1483,7 @@ static struct ubbd_backend_io* prepare_backend_io(struct ubbd_backend *ubbd_b,
 	data->io = clone_io;
 	data->orig_io = io;
 	data->ubbd_b = ubbd_b;
+	data->key_write = cache_get_key_write(ubbd_b, io);
 
 	return clone_io;
 }
@@ -1943,7 +1979,7 @@ static int cache_backend_flush(struct ubbd_backend *ubbd_b, struct ubbd_backend_
 {
 	struct ubbd_cache_backend *cache_b = CACHE_BACKEND(ubbd_b);
 
-	cache_key_ondisk_write();
+	cache_key_ondisk_write_all(ubbd_b);
 	cache_b->cache_backend->backend_ops->flush(cache_b->cache_backend, io);
 	cache_b->backing_backend->backend_ops->flush(cache_b->backing_backend, io);
 	return 0;

@@ -27,6 +27,9 @@ int ubbd_close_uio(struct ubbd_uio_info *uio_info)
 	int ret;
 	int retval = 0;
 
+	if (!uio_info || !uio_info->map)
+		return 0;
+
 	ret = munmap(uio_info->map, uio_info->uio_map_size);
 	if (ret != 0) {
 		ubbd_err("could not unmap device: %d\n", errno);
