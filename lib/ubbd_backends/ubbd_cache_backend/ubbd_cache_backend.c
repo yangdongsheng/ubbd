@@ -142,9 +142,18 @@ struct cache_key_handler {
 	struct list_head pending_key;
 	pthread_mutex_t	pending_key_lock;
 	pthread_t cache_key_thread;
+	pthread_cond_t pending_key_cond;
+	bool stop;
 };
 
-#define CACHE_HEY_HEAD_MAX	32
+static int cache_stop_key_handler(struct cache_key_handler *key_handler)
+{
+	key_handler->stop = true;
+
+	return pthread_join(key_handler->cache_key_thread, NULL);
+}
+
+#define CACHE_KEY_HEAD_MAX	32
 
 struct cache_super {
 	uint64_t	n_segs;
@@ -162,7 +171,7 @@ struct cache_super {
 
 	uint32_t last_key_epoch;
 
-	struct cache_key_handler key_handlers[CACHE_HEY_HEAD_MAX]
+	struct cache_key_handler key_handlers[CACHE_KEY_HEAD_MAX];
 
 	struct cache_key_ondisk_write *key_ondisk_w;
 };
@@ -1152,12 +1161,56 @@ static int cache_key_lists_init(struct ubbd_backend *ubbd_b)
 	return 0;
 }
 
+struct cache_backend_io_ctx_data {
+	struct ubbd_backend *ubbd_b;
+	struct ubbd_backend_io *io;
+	struct ubbd_backend_io *orig_io;
+	uint64_t backing_off;
+	bool cache_io;
+	struct cache_key *key;
+	struct list_head pending_node;
+	int ret;
+};
+
+static int cache_key_handle(struct cache_backend_io_ctx_data *data);
+static void *cache_key_thread_fn(void* args)
+{
+	int ret = 0;
+	struct cache_key_handler *key_handler = args;
+	struct cache_backend_io_ctx_data *data_tmp, *next;
+	LIST_HEAD(tmp_list);
+
+	while (true) {
+		if (key_handler->stop) {
+			break;
+		}
+
+		pthread_mutex_lock(&key_handler->pending_key_lock);
+		if (list_empty(&key_handler->pending_key)) {
+			pthread_cond_wait(&key_handler->pending_key_cond, &key_handler->pending_key_lock);
+		}
+		list_splice_init(&key_handler->pending_key, &tmp_list);
+		pthread_mutex_unlock(&key_handler->pending_key_lock);
+
+		list_for_each_entry_safe(data_tmp, next, &tmp_list, pending_node) {
+			cache_key_handle(data_tmp);
+		}
+	}
+
+	if (ret) {
+		ubbd_err("cache_key_thread exit with %d\n", ret);
+	}
+
+	return NULL;
+}
+
 static int cache_backend_open(struct ubbd_backend *ubbd_b)
 {
 	int ret = 0;
 	struct ubbd_cache_backend *cache_b = CACHE_BACKEND(ubbd_b);
 	struct cache_super_ondisk *sb;
 	char *verify_name;
+	int i;
 
 	cache_key_lists_init(ubbd_b);
 
@@ -1220,11 +1273,22 @@ static int cache_backend_open(struct ubbd_backend *ubbd_b)
 	cache_sb.n_segs = sb->n_segs;
 	cache_sb.last_key_epoch = sb->last_key_epoch;
 
+	for (i = 0; i < CACHE_KEY_HEAD_MAX; i++) {
+		struct cache_key_handler *key_handler = &cache_sb.key_handlers[i];
+
+		INIT_LIST_HEAD(&key_handler->pending_key);
+		pthread_mutex_init(&key_handler->pending_key_lock, NULL);
+		pthread_cond_init(&key_handler->pending_key_cond, NULL);
+		ret = pthread_create(&key_handler->cache_key_thread, NULL, cache_key_thread_fn, key_handler);
+		if (ret) {
+			goto stop_key_handlers;
+		}
+	}
 
 	ret = ubbd_open_uio(&ubbd_b->queues[0].uio_info);
 	if (ret) {
 		ubbd_err("failed to open uio for queue 0: %d\n", ret);
-		goto close_cache;
+		goto stop_key_handlers;
 	}
 
 	cache_sb.key_ondisk_w = ubbd_uio_get_info(&ubbd_b->queues[0].uio_info);
@@ -1233,10 +1297,9 @@ static int cache_backend_open(struct ubbd_backend *ubbd_b)
 	if (!cache_sb.segments) {
 		ubbd_err("failed to alloc mem for segments.\n");
 		ret = -ENOMEM;
-		goto close_cache;
+		goto close_uio;
 	}
 
-	int i;
 	for (i = 0; i < cache_sb.n_segs; i++) {
 		pthread_mutex_init(&cache_sb.segments[i].lock, NULL);
 		atomic_set(&cache_sb.segments[i].inflight, 0);
@@ -1253,7 +1316,6 @@ static int cache_backend_open(struct ubbd_backend *ubbd_b)
 	/* first segment is reserved */
 	ubbd_bit_set(cache_sb.seg_bitmap, 0);
 	dump_bitmap(cache_sb.seg_bitmap);
-
 
 	if (1) {
 		ubbd_err("before replay\n");
@@ -1277,6 +1339,15 @@ free_seg_bitmap:
 	ubbd_bitmap_free(cache_sb.seg_bitmap);
 free_segments:
 	free(cache_sb.segments);
+close_uio:
+	ubbd_close_uio(&ubbd_b->queues[0].uio_info);
+stop_key_handlers:
+	for (i = 0; i < CACHE_KEY_HEAD_MAX; i++) {
+		struct cache_key_handler *key_handler = &cache_sb.key_handlers[i];
+
+		if (key_handler->cache_key_thread)
+			cache_stop_key_handler(key_handler);
+	}
 close_cache:
 	ubbd_backend_close(cache_b->cache_backend);
 close_backing:
@@ -1303,6 +1374,7 @@ static void wait_for_cache_clean(struct ubbd_cache_backend *cache_b)
 static void cache_backend_close(struct ubbd_backend *ubbd_b)
 {
 	struct ubbd_cache_backend *cache_b = CACHE_BACKEND(ubbd_b);
+	int i;
 
 	cache_key_ondisk_write();
 
@@ -1317,6 +1389,12 @@ static void cache_backend_close(struct ubbd_backend *ubbd_b)
 	ubbd_bitmap_free(cache_sb.seg_bitmap);
 	free(cache_sb.segments);
 	ubbd_close_uio(&ubbd_b->queues[0].uio_info);
+	for (i = 0; i < CACHE_KEY_HEAD_MAX; i++) {
+		struct cache_key_handler *key_handler = &cache_sb.key_handlers[i];
+
+		if (key_handler->cache_key_thread)
+			cache_stop_key_handler(key_handler);
+	}
 	ubbd_backend_close(cache_b->cache_backend);
 	ubbd_backend_close(cache_b->backing_backend);
 }
@@ -1336,15 +1414,6 @@ static void cache_backend_release(struct ubbd_backend *ubbd_b)
 
 	free(cache_b);
 }
-
-struct cache_backend_io_ctx_data {
-	struct ubbd_backend *ubbd_b;
-	struct ubbd_backend_io *io;
-	struct ubbd_backend_io *orig_io;
-	uint64_t backing_off;
-	bool cache_io;
-	struct cache_key *key;
-};
 
 /*
 static int compare_iov_and_buf(struct iovec *iov, int iov_cnt, void *buf, int len)
@@ -1370,16 +1439,17 @@ static int compare_iov_and_buf(struct iovec *iov, int iov_cnt, void *buf, int le
 }
 */
 
-static int cache_backend_write_io_finish(struct context *ctx, int ret)
+static int cache_key_handle(struct cache_backend_io_ctx_data *data)
 {
-	struct cache_backend_io_ctx_data *data = (struct cache_backend_io_ctx_data *)ctx->data;
 	struct ubbd_backend_io *io = (struct ubbd_backend_io *)data->io;
 	struct ubbd_backend_io *orig_io = (struct ubbd_backend_io *)data->orig_io;
 	struct cache_key *key = data->key;
+	int ret = data->ret;
 
 	if (ret) {
 		ubbd_err("ret of cache_backend_io: type %d, %lu:%u: %s\n",
 				io->io_type, io->offset, io->len, strerror(-ret));
+		goto finish;
 	}
 
 	if (lcache_debug)
@@ -1401,6 +1471,26 @@ finish:
 	cache_seg_put(io->offset >> CACHE_SEG_SHIFT);
 	ubbd_backend_free_backend_io(data->ubbd_b, io);;
 	ubbd_backend_io_finish(orig_io, ret);
+
+	return 0;
+}
+
+static void queue_cache_pending_key(struct cache_key_handler *key_handler, struct cache_backend_io_ctx_data *data)
+{
+	pthread_mutex_lock(&key_handler->pending_key_lock);
+	list_add_tail(&key_handler->pending_key, &data->pending_node);
+	pthread_mutex_unlock(&key_handler->pending_key_lock);
+	pthread_cond_signal(&key_handler->pending_key_cond);
+}
+
+static int cache_backend_write_io_finish(struct context *ctx, int ret)
+{
+	struct cache_backend_io_ctx_data *data = (struct cache_backend_io_ctx_data *)ctx->data;
+	struct ubbd_backend_io *orig_io = (struct ubbd_backend_io *)data->orig_io;
+	struct cache_key_handler *key_handler = &cache_sb.key_handlers[(orig_io->offset >> CACHE_KEY_LIST_SHIFT) % CACHE_KEY_HEAD_MAX];
+
+	data->ret = ret;
+	queue_cache_pending_key(key_handler, data);
 
 	return 0;
 }
@@ -1458,6 +1548,7 @@ static struct ubbd_backend_io* prepare_backend_io(struct ubbd_backend *ubbd_b,
 	data->io = clone_io;
 	data->orig_io = io;
 	data->ubbd_b = ubbd_b;
+	INIT_LIST_HEAD(&data->pending_node);
 
 	return clone_io;
 }
