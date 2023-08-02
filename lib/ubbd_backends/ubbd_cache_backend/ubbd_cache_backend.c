@@ -149,6 +149,7 @@ struct cache_key_handler {
 static int cache_stop_key_handler(struct cache_key_handler *key_handler)
 {
 	key_handler->stop = true;
+	pthread_cond_signal(&key_handler->pending_key_cond);
 
 	return pthread_join(key_handler->cache_key_thread, NULL);
 }
@@ -1193,13 +1194,12 @@ static void *cache_key_thread_fn(void* args)
 		pthread_mutex_unlock(&key_handler->pending_key_lock);
 
 		list_for_each_entry_safe(data_tmp, next, &tmp_list, pending_node) {
+			list_del_init(&data_tmp->pending_node);
 			cache_key_handle(data_tmp);
 		}
 	}
 
-	if (ret) {
-		ubbd_err("cache_key_thread exit with %d\n", ret);
-	}
+	ubbd_err("cache_key_thread exit with %d\n", ret);
 
 	return NULL;
 }
@@ -1478,7 +1478,7 @@ finish:
 static void queue_cache_pending_key(struct cache_key_handler *key_handler, struct cache_backend_io_ctx_data *data)
 {
 	pthread_mutex_lock(&key_handler->pending_key_lock);
-	list_add_tail(&key_handler->pending_key, &data->pending_node);
+	list_add_tail(&data->pending_node, &key_handler->pending_key);
 	pthread_mutex_unlock(&key_handler->pending_key_lock);
 	pthread_cond_signal(&key_handler->pending_key_cond);
 }
@@ -1679,6 +1679,7 @@ static int cache_backend_writev(struct ubbd_backend *ubbd_b, struct ubbd_backend
 			goto finish;
 		}
 		cache_io->offset = key->p_off;
+		cache_io->ctx->free_on_finish = 0;
 
 		struct cache_backend_io_ctx_data *data;
 

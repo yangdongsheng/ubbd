@@ -257,6 +257,7 @@ struct context {
 	void *extra_data;
 	ubbd_atomic ref;
 	int ret;
+	int free_on_finish:1;
 	char data[];
 };
 
@@ -271,6 +272,7 @@ static inline struct context *context_alloc(size_t data_size)
 		return NULL;
 
 	ubbd_atomic_set(&ctx->ref, 1);
+	ctx->free_on_finish = 1;
 
 	return ctx;
 }
@@ -302,7 +304,8 @@ static inline int context_finish(struct context *ctx, int ret)
 	if (ctx->parent)
 		context_finish(ctx->parent, ctx->ret);
 
-	context_free(ctx);
+	if (ctx->free_on_finish)
+		context_free(ctx);
 	return ret;
 }
 
