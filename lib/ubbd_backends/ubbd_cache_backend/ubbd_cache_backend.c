@@ -138,6 +138,14 @@ struct data_head {
 
 #define CACHE_DATA_HEAD_MAX	32
 
+struct cache_key_handler {
+	struct list_head pending_key;
+	pthread_mutex_t	pending_key_lock;
+	pthread_t cache_key_thread;
+};
+
+#define CACHE_HEY_HEAD_MAX	32
+
 struct cache_super {
 	uint64_t	n_segs;
 	struct segment *segments;
@@ -155,6 +163,8 @@ struct cache_super {
 	uint32_t last_key_epoch;
 
 	struct cache_key_ondisk_write **key_ondisk_w_array;
+
+	struct cache_key_handler key_handlers[CACHE_HEY_HEAD_MAX]
 };
 
 static void dump_bitmap(struct ubbd_bitmap *bitmap)
