@@ -1479,8 +1479,8 @@ static void queue_cache_pending_key(struct cache_key_handler *key_handler, struc
 {
 	pthread_mutex_lock(&key_handler->pending_key_lock);
 	list_add_tail(&data->pending_node, &key_handler->pending_key);
-	pthread_mutex_unlock(&key_handler->pending_key_lock);
 	pthread_cond_signal(&key_handler->pending_key_cond);
+	pthread_mutex_unlock(&key_handler->pending_key_lock);
 }
 
 static int cache_backend_write_io_finish(struct context *ctx, int ret)
